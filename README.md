@@ -1,5 +1,7 @@
 #  Forge API
 
+[![CI](https://github.com/lucasfazzib/forge-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lucasfazzib/forge-api/actions/workflows/ci.yml)
+
 A lightweight, containerized API for interacting with **local Large Language Models through Ollama**.
 
 Forge API is part of the **Forge Local AI Lab** and provides a clean HTTP abstraction between applications and locally hosted LLMs.
@@ -18,12 +20,14 @@ Forge API currently provides:
 * Local LLM inference through Ollama
 * Model discovery
 * Chat/generation endpoint
+* Agent loop with typed tool registry, policy gate and structured outputs
 * Automatic OpenAPI documentation
 * Docker deployment
 * Dedicated Docker networking
 * Environment-based configuration
 * Local-only API exposure by default
 * Separation between routes, schemas, configuration and services
+* Unit and integration test suites, wired into GitHub Actions CI
 
 Current version:
 
@@ -110,15 +114,30 @@ forge-api/
 │   │   ├── __init__.py
 │   │   └── ollama.py
 │   │
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── registry.py
+│   │   └── system.py
+│   │
 │   ├── __init__.py
 │   └── main.py
 │
 ├── tests/
+│   ├── conftest.py
+│   ├── test_agent_evals.py
+│   └── test_registry.py
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+│
 ├── .env.example
 ├── .gitignore
 ├── Dockerfile
 ├── compose.yaml
+├── pytest.ini
 ├── requirements.txt
+├── requirements-dev.txt
 └── README.md
 ```
 
@@ -233,6 +252,199 @@ Response:
   "response": "..."
 }
 ```
+
+---
+
+### Agent
+
+```http
+POST /agent
+```
+
+Runs the message through the agent loop: the model may propose tool calls,
+the application decides whether to allow them, executes them explicitly, and
+either renders a deterministic answer from the tool result or asks the model
+for a plain answer without tools.
+
+Example — free-form question, no tool executed:
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent \
+  -H "Content-Type: application/json" \
+  -d '{"model": "hermes3:3b", "message": "Quanto é 2 + 2?"}'
+```
+
+```json
+{"model": "hermes3:3b", "used_tools": [], "response": "2 plus 2 é 4."}
+```
+
+Example — status question, tool executed, response rendered from validated data:
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent \
+  -H "Content-Type: application/json" \
+  -d '{"model": "hermes3:3b", "message": "Qual é o status atual do Forge?"}'
+```
+
+```json
+{
+  "model": "hermes3:3b",
+  "used_tools": ["get_forge_status"],
+  "response": "Forge API: online. Ollama: online. Modelos locais instalados: hermes3:3b, gemma3:4b."
+}
+```
+
+---
+
+## Agent Architecture
+
+The `/agent` endpoint implements a manual agent loop. No agent framework is used.
+
+```text
+User message
+     │
+     ▼
+LLM call #1 (with tools spec)
+     │
+     ├── structured tool_calls? ── no ── allowlisted textual fallback? ── no ──▶ LLM call #2 (without tools) ──▶ direct answer
+     │                                                                 │
+     │                                                                 yes (get_forge_status only)
+     │                                                                 │
+     └── yes ◀──────────────────────────────────────────────────────────┘
+              │
+              ▼
+        Policy gate on user intent
+              │
+              ├── denied ──▶ used_tools=[] ──▶ LLM call #2 (without tools)
+              │
+              allowed
+              │
+              ▼
+        execute_tool()
+          - reject unknown tools (registry authoritative)
+          - validate arguments (Pydantic input_model)
+          - call handler
+          - validate result (Pydantic output_model)
+              │
+              ▼
+        Deterministic renderer available for this tool?
+              │
+              ├── yes ──▶ render text from validated tool result ──▶ response
+              │
+              no
+              │
+              ▼
+        LLM call #3 with format=answer_schema (Ollama structured output)
+              │
+              ▼
+        parse & (optionally) render ──▶ response
+```
+
+### Trust boundaries
+
+The LLM output is treated as untrusted input at every step:
+
+1. **Registry is authoritative.** `execute_tool` only runs functions in `TOOL_REGISTRY`. A function name proposed by the model is never resolved dynamically.
+2. **Policy gate on user intent, not on model output.** The gate reads the original user message. Adversarial mentions of a tool name in the user message are stripped before matching keywords.
+3. **Typed contracts on both sides.** `arguments` (LLM → app) are validated against the tool's `input_model` before execution; the handler's return value is validated against the `output_model` before being sent back to the LLM.
+4. **Deterministic rendering over LLM synthesis.** When a validated tool result is available and the tool declares an `answer_renderer`, the final LLM call is skipped and the response is rendered from the tool result. Zero room for hallucination.
+
+### Tool registry
+
+Tools are declared in `app/tools/registry.py` as `RegisteredTool` entries:
+
+```python
+RegisteredTool(
+    name="get_forge_status",
+    description="...",
+    input_model=ForgeStatusInput,     # extra='forbid'
+    output_model=ForgeStatusOutput,   # extra='forbid'
+    handler=get_forge_status,
+    answer_model=ForgeStatusOutput,
+    answer_renderer=_render_forge_status,
+)
+```
+
+The tool spec exposed to the LLM (`TOOLS`) is generated from `input_model.model_json_schema()` — a single source of truth.
+
+---
+
+## Testing
+
+Two suites, separated by intent.
+
+**Unit tests** — `tests/test_registry.py`. No Ollama, no HTTP. Cover the registry contracts: unknown tool rejection, argument validation, handler output validation, JSON Schema generation, deterministic renderer. Run in CI.
+
+**Integration tests / evals** — `tests/test_agent_evals.py`. Hit the running `/agent` endpoint against a real Ollama backend. Cover: free-form math (no tool, no pseudo-tool-call leakage), status question (tool executed, response grounded in tool result), adversarial tool name mention (blocked), unrelated knowledge questions (no tool). Marked with `@pytest.mark.integration`. Not run in CI (yet).
+
+Install dev dependencies:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run unit tests only:
+
+```bash
+pytest -m "not integration"
+```
+
+Run integration tests (requires `docker compose up -d --build forge-api` and Ollama):
+
+```bash
+pytest -m integration
+```
+
+Point tests at a different host:
+
+```bash
+FORGE_API_URL=http://127.0.0.1:8000 pytest -m integration
+```
+
+---
+
+## Continuous Integration
+
+GitHub Actions workflow at `.github/workflows/ci.yml` runs on push and pull request to `main` and `dev`:
+
+* **test** — installs dependencies, prints collected unit tests, then runs `pytest -m "not integration"`. Configured with `--strict-markers` and `--strict-config` to fail loudly on misconfiguration (defense against false-green).
+* **docker-build** — builds the Docker image with Buildx to guarantee the Dockerfile stays valid. Does not push.
+
+Integration tests are not part of CI because the runner has no Ollama backend. They are run locally against the containerized Forge API.
+
+---
+
+## Development Workflow
+
+Three long-lived branches:
+
+```text
+feature branches  ─▶  dev  ─▶  main
+     (work)         (integration)   (release)
+```
+
+* `main` — protected. Only receives merges from `dev` (release) or focused hotfix branches. This is what production/self-hosted deployments track.
+* `dev` — integration branch. Receives feature and fix branches. CI must be green before merging into `main`.
+* `feat/*`, `fix/*`, `chore/*` — short-lived working branches, cut from `dev`.
+
+Typical flow:
+
+```bash
+git checkout dev
+git pull --ff-only
+git checkout -b feat/short-descriptive-name
+
+# work, commit, push
+git push -u origin feat/short-descriptive-name
+
+# open a PR: feat/... -> dev
+# CI runs; after review + green CI, merge into dev.
+
+# when a set of changes on dev is ready to promote:
+# open a PR: dev -> main
+```
+
+Commit messages follow Conventional Commits (`feat:`, `fix:`, `chore:`, `test:`, `docs:`).
 
 ---
 

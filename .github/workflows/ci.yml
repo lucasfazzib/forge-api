@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -34,8 +34,11 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      - name: Show collected unit tests
+        run: pytest --collect-only -q -m "not integration" tests/
+
       - name: Run unit tests
-        run: pytest -q -m "not integration" tests/
+        run: pytest -v -m "not integration" tests/
 
   docker-build:
     name: Docker image builds
