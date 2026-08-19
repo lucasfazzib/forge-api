@@ -294,6 +294,22 @@ curl -X POST http://127.0.0.1:8000/agent \
 }
 ```
 
+Example — model details question, tool executed, arguments extracted from the message:
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent \
+  -H "Content-Type: application/json" \
+  -d '{"model": "hermes3:3b", "message": "Detalhes do modelo hermes3:3b: parâmetros e quantização."}'
+```
+
+```json
+{
+  "model": "hermes3:3b",
+  "used_tools": ["get_ollama_model_details"],
+  "response": "Modelo: hermes3:3b. Família: llama. Parâmetros: 3.2B. Quantização: Q4_K_M. Formato: gguf."
+}
+```
+
 ---
 
 ## Agent Architecture
@@ -306,11 +322,11 @@ User message
      ▼
 LLM call #1 (with tools spec)
      │
-     ├── structured tool_calls? ── no ── allowlisted textual fallback? ── no ──▶ LLM call #2 (without tools) ──▶ direct answer
-     │                                                                 │
-     │                                                                 yes (get_forge_status only)
-     │                                                                 │
-     └── yes ◀──────────────────────────────────────────────────────────┘
+     ├── structured tool_calls? ── no ── deterministic router matches? ── no ── allowlisted textual fallback? ── no ──▶ LLM call #2 (without tools) ──▶ direct answer
+     │                                          │                                             │
+     │                                          yes                                           yes (zero-arg tool + gate)
+     │                                          │                                             │
+     └── yes ◀──────────────────────────────────┴─────────────────────────────────────────────┘
               │
               ▼
         Policy gate on user intent
@@ -323,7 +339,7 @@ LLM call #1 (with tools spec)
         execute_tool()
           - reject unknown tools (registry authoritative)
           - validate arguments (Pydantic input_model)
-          - call handler
+          - call handler (HTTP errors become structured tool errors)
           - validate result (Pydantic output_model)
               │
               ▼
@@ -345,9 +361,10 @@ LLM call #1 (with tools spec)
 The LLM output is treated as untrusted input at every step:
 
 1. **Registry is authoritative.** `execute_tool` only runs functions in `TOOL_REGISTRY`. A function name proposed by the model is never resolved dynamically.
-2. **Policy gate on user intent, not on model output.** The gate reads the original user message. Adversarial mentions of a tool name in the user message are stripped before matching keywords.
-3. **Typed contracts on both sides.** `arguments` (LLM → app) are validated against the tool's `input_model` before execution; the handler's return value is validated against the `output_model` before being sent back to the LLM.
+2. **Policy gate on user intent, not on model output.** Each tool declares its own `allow(message)` predicate. The gate reads the original user message. Literal mentions of any registered tool name are stripped from the message before matching keywords, so an adversarial or accidental mention of a tool name cannot by itself satisfy the gate.
+3. **Typed contracts on both sides.** `arguments` (LLM → app) are validated against the tool's `input_model` before execution; the handler's return value is validated against the `output_model` before being sent back to the LLM. HTTP errors from tool handlers are captured as structured error results, not propagated to the client.
 4. **Deterministic rendering over LLM synthesis.** When a validated tool result is available and the tool declares an `answer_renderer`, the final LLM call is skipped and the response is rendered from the tool result. Zero room for hallucination.
+5. **App-side deterministic router as a fallback.** Small models like `hermes3:3b` have unreliable tool selection when more than one tool is offered. When the LLM fails to emit a valid `tool_call`, the app checks whether exactly one tool's policy gate matches the user message and whether the tool's `arg_extractor` can pull required arguments from the message. If so, the app invokes the tool explicitly. This is the trust boundary that says: the app owns routing when the model is unreliable.
 
 ### Tool registry
 
@@ -355,17 +372,24 @@ Tools are declared in `app/tools/registry.py` as `RegisteredTool` entries:
 
 ```python
 RegisteredTool(
-    name="get_forge_status",
+    name="get_ollama_model_details",
     description="...",
-    input_model=ForgeStatusInput,     # extra='forbid'
-    output_model=ForgeStatusOutput,   # extra='forbid'
-    handler=get_forge_status,
-    answer_model=ForgeStatusOutput,
-    answer_renderer=_render_forge_status,
+    input_model=ModelDetailsInput,       # extra='forbid', requires `model`
+    output_model=ModelDetailsOutput,     # extra='forbid'
+    handler=get_ollama_model_details,
+    answer_model=ModelDetailsOutput,
+    answer_renderer=_render_model_details,
+    allow=_model_details_allow,          # policy gate for this tool
+    arg_extractor=_extract_model_details_args,  # deterministic router support
 )
 ```
 
-The tool spec exposed to the LLM (`TOOLS`) is generated from `input_model.model_json_schema()` — a single source of truth.
+The tool spec exposed to the LLM (`TOOLS`) is generated from `input_model.model_json_schema()` — a single source of truth. Adding a new tool means adding one `RegisteredTool` entry and nothing else in the routing layer.
+
+Currently registered tools:
+
+* `get_forge_status` — zero-argument tool that reports Forge API, Ollama and installed local model tags.
+* `get_ollama_model_details` — takes `model: str`, returns family, parameter size, quantization level, format.
 
 ---
 
@@ -373,9 +397,9 @@ The tool spec exposed to the LLM (`TOOLS`) is generated from `input_model.model_
 
 Two suites, separated by intent.
 
-**Unit tests** — `tests/test_registry.py`. No Ollama, no HTTP. Cover the registry contracts: unknown tool rejection, argument validation, handler output validation, JSON Schema generation, deterministic renderer. Run in CI.
+**Unit tests** — `tests/test_registry.py`. No Ollama, no HTTP. Cover the registry contracts: unknown tool rejection, argument validation, handler output validation, JSON Schema generation, deterministic renderer, per-tool policy gate, deterministic router. Run in CI.
 
-**Integration tests / evals** — `tests/test_agent_evals.py`. Hit the running `/agent` endpoint against a real Ollama backend. Cover: free-form math (no tool, no pseudo-tool-call leakage), status question (tool executed, response grounded in tool result), adversarial tool name mention (blocked), unrelated knowledge questions (no tool). Marked with `@pytest.mark.integration`. Not run in CI (yet).
+**Integration tests / evals** — `tests/test_agent_evals.py`. Hit the running `/agent` endpoint against a real Ollama backend. Cover: free-form math (no tool, no pseudo-tool-call leakage), status question (tool executed, response grounded in tool result), model details question (tool executed via deterministic router, argument extracted from the message), adversarial tool name mentions (blocked), unrelated knowledge questions (no tool). Marked with `@pytest.mark.integration`. Not run in CI (yet).
 
 Install dev dependencies:
 
