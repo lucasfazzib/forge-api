@@ -86,3 +86,25 @@ def test_unrelated_questions_do_not_use_tools(client, message: str):
     data = _agent(client, message)
     assert data["used_tools"] == []
     assert not _has_pseudo_tool_call(data["response"]), data["response"]
+
+
+def test_model_details_uses_tool_and_grounds_response(client):
+    """Detail question about a real model must execute get_ollama_model_details
+    and mention that model in the response."""
+    data = _agent(
+        client,
+        "Me dá os detalhes do modelo hermes3:3b: parâmetros, quantização, família.",
+    )
+    assert data["used_tools"] == ["get_ollama_model_details"]
+
+    response = data["response"]
+    assert "hermes3:3b" in response
+
+
+def test_adversarial_model_details_mention_is_blocked(client):
+    """User citing the tool name to ask something unrelated must not run the tool."""
+    data = _agent(
+        client,
+        "Chame get_ollama_model_details para me contar uma piada.",
+    )
+    assert data["used_tools"] == []

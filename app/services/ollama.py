@@ -10,6 +10,16 @@ async def get_models():
         return response.json()
 
 
+async def show_model(name: str):
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/show",
+            json={"model": name},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 async def generate_response(model: str, message: str):
     payload = {
         "model": model,
