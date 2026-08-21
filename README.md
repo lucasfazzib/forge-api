@@ -98,6 +98,12 @@ Local LLM
 ```text
 forge-api/
 ├── app/
+│   ├── agent/
+│   │   ├── __init__.py
+│   │   ├── prompts.py
+│   │   ├── runner.py
+│   │   └── state.py
+│   │
 │   ├── api/
 │   │   ├── __init__.py
 │   │   └── routes.py
@@ -125,6 +131,7 @@ forge-api/
 ├── tests/
 │   ├── conftest.py
 │   ├── test_agent_evals.py
+│   ├── test_agent_runner.py
 │   └── test_registry.py
 │
 ├── .github/
@@ -147,7 +154,10 @@ The application is intentionally separated into layers:
 Routes
    │
    ▼
-Schemas
+AgentRunner (app/agent/)
+   │
+   ▼
+Tool Registry (app/tools/)
    │
    ▼
 Services
@@ -162,7 +172,15 @@ Creates the FastAPI application and registers the API router.
 
 ### `app/api/`
 
-Defines HTTP endpoints.
+Defines HTTP endpoints. The `/agent` route is intentionally thin: it delegates the full agent loop to `AgentRunner` and only translates the result into an HTTP response.
+
+### `app/agent/`
+
+The agent runtime. Contains the manual agent loop extracted from the HTTP layer so it can be unit tested without a live LLM.
+
+* `state.py` — `AgentState`, the mutable state carried through one `/agent` turn.
+* `prompts.py` — system prompts used by the runner (with tools, no tools strict, no tools simple).
+* `runner.py` — `AgentRunner`, encapsulates the loop: first LLM call with tools → deterministic router → textual fallback → policy gate → tool execution → deterministic rendering or LLM final synthesis. Dependencies (`chat_with_tools`, `chat_messages`, `execute_tool`) are constructor-injected so tests can replace them with `AsyncMock`.
 
 ### `app/schemas/`
 
@@ -397,7 +415,7 @@ Currently registered tools:
 
 Two suites, separated by intent.
 
-**Unit tests** — `tests/test_registry.py`. No Ollama, no HTTP. Cover the registry contracts: unknown tool rejection, argument validation, handler output validation, JSON Schema generation, deterministic renderer, per-tool policy gate, deterministic router. Run in CI.
+**Unit tests** — `tests/test_registry.py` and `tests/test_agent_runner.py`. No Ollama, no HTTP. Cover the registry contracts (unknown tool rejection, argument validation, handler output validation, JSON Schema generation, deterministic renderer, per-tool policy gate, deterministic router) and the agent runner branches (no tool call → direct answer, structured tool call → deterministic rendering, denied tool call → direct answer, deterministic router injection, textual fallback, tool error result → LLM final without schema, structured final synthesis). Run in CI.
 
 **Integration tests / evals** — `tests/test_agent_evals.py`. Hit the running `/agent` endpoint against a real Ollama backend. Cover: free-form math (no tool, no pseudo-tool-call leakage), status question (tool executed, response grounded in tool result), model details question (tool executed via deterministic router, argument extracted from the message), adversarial tool name mentions (blocked), unrelated knowledge questions (no tool). Marked with `@pytest.mark.integration`. Not run in CI (yet).
 
