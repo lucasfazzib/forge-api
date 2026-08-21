@@ -38,7 +38,24 @@ jobs:
         run: pytest --collect-only -q -m "not integration" tests/
 
       - name: Run unit tests
-        run: pytest -v -m "not integration" tests/
+        run: pytest -v -m "not integration" tests/ --junit-xml=pytest-report.xml
+
+      - name: Guard against false-green (no tests / all skipped)
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('pytest-report.xml').getroot()
+          ts = root.find('testsuite') if root.tag == 'testsuites' else root
+          tests = int(ts.get('tests', '0'))
+          skipped = int(ts.get('skipped', '0'))
+          errors = int(ts.get('errors', '0'))
+          failures = int(ts.get('failures', '0'))
+          print(f'tests={tests} skipped={skipped} errors={errors} failures={failures}')
+          if tests == 0:
+              raise SystemExit('CI false-green guard: no unit tests were collected.')
+          if tests > 0 and skipped == tests:
+              raise SystemExit('CI false-green guard: all unit tests were skipped.')
+          PY
 
   docker-build:
     name: Docker image builds
